@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,11 +13,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Shashwat009319/apishield/internal/database"
 	"github.com/Shashwat009319/apishield/internal/scanner"
 )
 
+type scanRepository interface {
+	SaveScan(context.Context, database.ScanRecord) error
+	ListScans(context.Context) ([]database.ScanRecord, error)
+}
+
 type API struct {
 	scanner *scanner.Scanner
+	repo    scanRepository
 	mu      sync.RWMutex
 	scans   []ScanRecord
 }
@@ -53,8 +61,17 @@ type DashboardSummary struct {
 }
 
 func New(addr string) *http.Server {
+	return newServer(addr, nil)
+}
+
+func NewWithDatabase(addr string, db *database.Database) *http.Server {
+	return newServer(addr, db)
+}
+
+func newServer(addr string, repo scanRepository) *http.Server {
 	api := &API{
 		scanner: scanner.New(),
+		repo:    repo,
 		scans:   make([]ScanRecord, 0),
 	}
 
@@ -83,28 +100,64 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *API) dashboardSummary(w http.ResponseWriter, r *http.Request) {
+func (a *API) getScans(ctx context.Context) ([]ScanRecord, error) {
+	if a.repo != nil {
+		stored, err := a.repo.ListScans(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		scans := make([]ScanRecord, 0, len(stored))
+		for _, item := range stored {
+			scans = append(scans, ScanRecord{
+				ID:          item.ID,
+				TargetURL:   item.TargetURL,
+				Status:      item.Status,
+				StartedAt:   item.StartedAt,
+				CompletedAt: item.CompletedAt,
+				Result:      item.Result,
+			})
+		}
+		return scans, nil
+	}
+
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	summary := DashboardSummary{
-		Status:         "ok",
-		ScansCompleted: len(a.scans),
-		URLsAssessed:   len(a.scans),
+	scans := make([]ScanRecord, len(a.scans))
+	copy(scans, a.scans)
+	return scans, nil
+}
+
+func (a *API) dashboardSummary(w http.ResponseWriter, r *http.Request) {
+	scans, err := a.getScans(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load dashboard data")
+		return
 	}
 
-	if len(a.scans) == 0 {
+	summary := DashboardSummary{
+		Status:         "ok",
+		ScansCompleted: len(scans),
+		URLsAssessed:   len(scans),
+	}
+
+	if len(scans) == 0 {
 		writeJSON(w, http.StatusOK, summary)
 		return
 	}
 
 	summary.HasAssessment = true
-	summary.LastScan = &a.scans[len(a.scans)-1].CompletedAt
-
 	score := 100
 
-	for _, scan := range a.scans {
-		for _, finding := range scan.Result.Findings {
+	for i := range scans {
+		if summary.LastScan == nil ||
+			scans[i].CompletedAt.After(*summary.LastScan) {
+			last := scans[i].CompletedAt
+			summary.LastScan = &last
+		}
+
+		for _, finding := range scans[i].Result.Findings {
 			summary.OpenFindings++
 
 			switch finding.Severity {
@@ -126,16 +179,18 @@ func (a *API) dashboardSummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	summary.SecurityPosture = score
-
 	writeJSON(w, http.StatusOK, summary)
 }
 
 func (a *API) listScans(w http.ResponseWriter, r *http.Request) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	scans, err := a.getScans(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load scans")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"scans": a.scans,
+		"scans": scans,
 	})
 }
 
@@ -188,9 +243,25 @@ func (a *API) createScan(w http.ResponseWriter, r *http.Request) {
 		Result:      result,
 	}
 
-	a.mu.Lock()
-	a.scans = append(a.scans, record)
-	a.mu.Unlock()
+	if a.repo != nil {
+		err := a.repo.SaveScan(r.Context(), database.ScanRecord{
+			ID:          record.ID,
+			TargetURL:   record.TargetURL,
+			Status:      record.Status,
+			StartedAt:   record.StartedAt,
+			CompletedAt: record.CompletedAt,
+			Result:      record.Result,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError,
+				"scan completed but could not be saved")
+			return
+		}
+	} else {
+		a.mu.Lock()
+		a.scans = append(a.scans, record)
+		a.mu.Unlock()
+	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"scan": record,
@@ -205,7 +276,6 @@ func (a *API) middleware(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 
 		origin := r.Header.Get("Origin")
-
 		allowed := origin == "http://localhost:5173" ||
 			origin == "http://127.0.0.1:5173"
 
@@ -222,8 +292,7 @@ func (a *API) middleware(next http.Handler) http.Handler {
 
 			w.Header().Set("Access-Control-Allow-Methods",
 				"GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers",
-				"Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -232,11 +301,7 @@ func (a *API) middleware(next http.Handler) http.Handler {
 	})
 }
 
-func decodeJSON(
-	w http.ResponseWriter,
-	r *http.Request,
-	destination any,
-) error {
+func decodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 
 	decoder := json.NewDecoder(r.Body)
@@ -247,7 +312,6 @@ func decodeJSON(
 	}
 
 	var extra any
-
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return errors.New("request must contain only one JSON object")
 	}

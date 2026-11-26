@@ -10,7 +10,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Shashwat009319/apishield/internal/database"
 	"github.com/Shashwat009319/apishield/internal/httpapi"
+	"github.com/joho/godotenv"
 )
 
 func main() {
@@ -20,6 +22,13 @@ func main() {
 }
 
 func run() error {
+	_ = godotenv.Load()
+
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return errors.New("DATABASE_URL is not configured")
+	}
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -27,8 +36,18 @@ func run() error {
 	)
 	defer stop()
 
-	server := httpapi.New("127.0.0.1:8080")
+	dbCtx, cancelDB := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelDB()
 
+	db, err := database.Open(dbCtx, databaseURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	log.Println("PostgreSQL connected successfully")
+
+	server := httpapi.NewWithDatabase("127.0.0.1:8080", db)
 	serverErr := make(chan error, 1)
 
 	go func() {
@@ -51,7 +70,6 @@ func run() error {
 		defer cancel()
 
 		log.Println("Shutting down APIShield...")
-
 		return server.Shutdown(shutdownCtx)
 	}
 }
