@@ -14,17 +14,27 @@ import (
 	"time"
 
 	"github.com/Shashwat009319/apishield/internal/database"
+	"github.com/Shashwat009319/apishield/internal/openapi"
 	"github.com/Shashwat009319/apishield/internal/scanner"
 )
+
+const maxSpecSize = 2 << 20 // 2 MiB
 
 type scanRepository interface {
 	SaveScan(context.Context, database.ScanRecord) error
 	ListScans(context.Context) ([]database.ScanRecord, error)
 }
 
+type specRepository interface {
+	SaveAPISpec(context.Context, string, *openapi.ParsedSpec) error
+	ListAPISpecs(context.Context) ([]database.APISpecRecord, error)
+	GetAPISpec(context.Context, string) (*openapi.ParsedSpec, error)
+}
+
 type API struct {
 	scanner *scanner.Scanner
 	repo    scanRepository
+	specs   specRepository
 	mu      sync.RWMutex
 	scans   []ScanRecord
 }
@@ -68,11 +78,15 @@ func NewWithDatabase(addr string, db *database.Database) *http.Server {
 	return newServer(addr, db)
 }
 
-func newServer(addr string, repo scanRepository) *http.Server {
+func newServer(addr string, db *database.Database) *http.Server {
 	api := &API{
 		scanner: scanner.New(),
-		repo:    repo,
 		scans:   make([]ScanRecord, 0),
+	}
+
+	if db != nil {
+		api.repo = db
+		api.specs = db
 	}
 
 	mux := http.NewServeMux()
@@ -81,6 +95,10 @@ func newServer(addr string, repo scanRepository) *http.Server {
 	mux.HandleFunc("GET /api/v1/dashboard/summary", api.dashboardSummary)
 	mux.HandleFunc("GET /api/v1/scans", api.listScans)
 	mux.HandleFunc("POST /api/v1/scans", api.createScan)
+
+	mux.HandleFunc("POST /api/v1/specs", api.uploadSpec)
+	mux.HandleFunc("GET /api/v1/specs", api.listSpecs)
+	mux.HandleFunc("GET /api/v1/specs/{id}", api.getSpec)
 
 	return &http.Server{
 		Addr:              addr,
@@ -96,7 +114,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, HealthResponse{
 		Status:  "ok",
 		Service: "apishield",
-		Version: "0.2.0",
+		Version: "0.3.0",
 	})
 }
 
@@ -189,9 +207,7 @@ func (a *API) listScans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"scans": scans,
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"scans": scans})
 }
 
 func (a *API) createScan(w http.ResponseWriter, r *http.Request) {
@@ -203,8 +219,7 @@ func (a *API) createScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !request.AuthorizationConfirmed {
-		writeError(w, http.StatusBadRequest,
-			"explicit authorization confirmation is required")
+		writeError(w, http.StatusBadRequest, "explicit authorization confirmation is required")
 		return
 	}
 
@@ -227,10 +242,9 @@ func (a *API) createScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := newScanID()
+	id, err := newID("scan")
 	if err != nil {
-		writeError(w, http.StatusInternalServerError,
-			"could not generate scan ID")
+		writeError(w, http.StatusInternalServerError, "could not generate scan ID")
 		return
 	}
 
@@ -253,8 +267,7 @@ func (a *API) createScan(w http.ResponseWriter, r *http.Request) {
 			Result:      record.Result,
 		})
 		if err != nil {
-			writeError(w, http.StatusInternalServerError,
-				"scan completed but could not be saved")
+			writeError(w, http.StatusInternalServerError, "scan completed but could not be saved")
 			return
 		}
 	} else {
@@ -263,8 +276,106 @@ func (a *API) createScan(w http.ResponseWriter, r *http.Request) {
 		a.mu.Unlock()
 	}
 
+	writeJSON(w, http.StatusCreated, map[string]any{"scan": record})
+}
+
+// uploadSpec accepts a multipart form containing a file field named "file".
+func (a *API) uploadSpec(w http.ResponseWriter, r *http.Request) {
+	if a.specs == nil {
+		writeError(w, http.StatusServiceUnavailable, "API inventory requires database storage")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxSpecSize+256*1024)
+
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart upload or file too large")
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "upload a specification using the file field")
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxSpecSize+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "could not read uploaded specification")
+		return
+	}
+	if len(data) == 0 {
+		writeError(w, http.StatusBadRequest, "uploaded specification is empty")
+		return
+	}
+	if len(data) > maxSpecSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "specification exceeds the 2 MiB limit")
+		return
+	}
+
+	parsed, err := openapi.Parse(data)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	id, err := newID("spec")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not generate specification ID")
+		return
+	}
+
+	if err := a.specs.SaveAPISpec(r.Context(), id, parsed); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not save API specification")
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"scan": record,
+		"id":   id,
+		"spec": parsed,
+	})
+}
+
+func (a *API) listSpecs(w http.ResponseWriter, r *http.Request) {
+	if a.specs == nil {
+		writeError(w, http.StatusServiceUnavailable, "API inventory requires database storage")
+		return
+	}
+
+	specs, err := a.specs.ListAPISpecs(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load API inventory")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"specs": specs})
+}
+
+func (a *API) getSpec(w http.ResponseWriter, r *http.Request) {
+	if a.specs == nil {
+		writeError(w, http.StatusServiceUnavailable, "API inventory requires database storage")
+		return
+	}
+
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "specification ID is required")
+		return
+	}
+
+	spec, err := a.specs.GetAPISpec(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "API specification not found")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":   id,
+		"spec": spec,
 	})
 }
 
@@ -290,8 +401,7 @@ func (a *API) middleware(next http.Handler) http.Handler {
 				return
 			}
 
-			w.Header().Set("Access-Control-Allow-Methods",
-				"GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -326,17 +436,15 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{
-		"error": message,
-	})
+	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func newScanID() (string, error) {
+func newID(prefix string) (string, error) {
 	var bytes [8]byte
 
 	if _, err := rand.Read(bytes[:]); err != nil {
 		return "", err
 	}
 
-	return "scan_" + hex.EncodeToString(bytes[:]), nil
+	return prefix + "_" + hex.EncodeToString(bytes[:]), nil
 }

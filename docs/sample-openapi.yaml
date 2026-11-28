@@ -1,0 +1,38 @@
+﻿openapi: 3.0.3
+info:
+  title: APIShield Demo API
+  version: 1.0.0
+  description: Demo API for APIShield inventory testing
+paths:
+  /users:
+    get:
+      summary: List users
+      operationId: listUsers
+      responses:
+        "200":
+          description: Successful response
+    post:
+      summary: Create user
+      operationId: createUser
+      security:
+        - bearerAuth: []
+      responses:
+        "201":
+          description: User created
+  /users/{id}:
+    get:
+      summary: Get user by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: User found
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
